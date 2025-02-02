@@ -106,6 +106,8 @@ static std::string format(const char * fmt, ...) {
 #define KEY_HAS_QWEN2VL_MERGER  "clip.has_qwen2vl_merger"
 #define KEY_USE_GELU            "clip.use_gelu"
 #define KEY_USE_SILU            "clip.use_silu"
+#define KEY_USE_GLU_MLP         "clip.use_glu_mlp"
+#define KEY_USE_RMS_NORM        "clip.use_rms_norm"
 #define KEY_N_EMBD              "clip.%s.embedding_length"
 #define KEY_N_FF                "clip.%s.feed_forward_length"
 #define KEY_N_BLOCK             "clip.%s.block_count"
@@ -123,6 +125,7 @@ static std::string format(const char * fmt, ...) {
 #define KEY_MM_PATCH_MERGE_TYPE   "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS  "clip.vision.image_grid_pinpoints"
 #define KEY_IMAGE_CROP_RESOLUTION "clip.vision.image_crop_resolution"
+#define KEY_FULLATTN_BLK_IDX      "clip.vision.fullatt_block_indexes"
 
 
 //
@@ -141,6 +144,7 @@ static std::string format(const char * fmt, ...) {
 #define TN_ATTN_OUTPUT     "%s.blk.%d.attn_out.%s"
 #define TN_FFN_DOWN        "%s.blk.%d.ffn_down.%s"
 #define TN_FFN_UP          "%s.blk.%d.ffn_up.%s"
+#define TN_FFN_GATE        "%s.blk.%d.ffn_gate.%s"
 #define TN_LN_1            "%s.blk.%d.ln1.%s"
 #define TN_LN_2            "%s.blk.%d.ln2.%s"
 #define TN_LN_PRE          "%s.pre_ln.%s"
@@ -434,6 +438,7 @@ struct clip_hparams {
 
     int32_t image_grid_pinpoints[32];
     int32_t image_crop_resolution;
+    std::vector<int32_t> full_attn_layers;
 };
 
 struct clip_layer {
@@ -458,6 +463,9 @@ struct clip_layer {
 
     struct ggml_tensor * ff_o_w;
     struct ggml_tensor * ff_o_b;
+
+    struct ggml_tensor * ff_g_w = NULL;
+    struct ggml_tensor * ff_g_b = NULL;
 
     // layernorm 2
     struct ggml_tensor * ln_2_w;
@@ -570,6 +578,8 @@ struct clip_ctx {
     float image_std[3];
     bool use_gelu = false;
     bool use_silu = false;
+    bool use_glu_mlp = false;
+    bool use_rms_norm = false;
     int32_t ftype = 1;
 
     bool has_class_embedding = true;
@@ -634,6 +644,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
     const int d_head               = hidden_size / n_head;
     int n_layer                    = hparams.n_layer;
     const float eps                = hparams.eps;
+    const bool use_window_attn     = hparams.full_attn_layers.size() > 0;
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
 
     const int batch_size = imgs->size;
@@ -684,8 +695,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         // inp = ggml_add(ctx0, inp, ggml_repeat(ctx0, model.patch_bias, inp));
         inp = ggml_add(ctx0, inp, model.patch_bias);
     }
-    struct ggml_tensor * embeddings = inp;
-    struct ggml_tensor * pos_embed = nullptr;
+    struct ggml_tensor * embeddings  = inp;
+    struct ggml_tensor * pos_embed   = nullptr;
+    struct ggml_tensor * window_mask = nullptr;
+    struct ggml_tensor * window_idx  = nullptr;
 
     if (ctx->has_llava_projector) {
         // concat class_embeddings and patch_embeddings
@@ -738,15 +751,40 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         // TODO: figure out why we doing thing in this way ???
         n_layer += 1;
     }
+
+    if (use_window_attn) {
+        window_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, num_positions / 4);
+        ggml_set_name(window_idx, "window_idx");
+        ggml_set_input(window_idx);
+
+        // mask for window attention
+        window_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, num_positions, num_positions);
+        ggml_set_name(window_mask, "window_mask");
+        ggml_set_input(window_mask);
+
+        // embeddings shape: [hidden_size, patches_w * patches_h, batch_size]
+        GGML_ASSERT(batch_size == 1);
+        embeddings = ggml_reshape_2d(ctx0, embeddings, hidden_size * 4, patches_w * patches_h * batch_size / 4);
+        embeddings = ggml_get_rows(ctx0, embeddings, window_idx);
+        embeddings = ggml_reshape_3d(ctx0, embeddings, hidden_size, patches_w * patches_h, batch_size);
+
+        positions = ggml_reshape_2d(ctx0, positions, 16, num_position_ids / 4 / 4);
+        positions = ggml_get_rows(ctx0, positions, window_idx);
+        positions = ggml_reshape_1d(ctx0, positions, num_position_ids);
+    }
+
     for (int il = 0; il < n_layer - 1; il++) {
         struct ggml_tensor * cur = embeddings; // embeddings = residual, cur = hidden_states
 
         //const size_t nb_q_w = model.layers[il].q_w->nb[0];
 
         // layernorm1
-        {
+        if (ctx->use_rms_norm) {
+            cur = ggml_rms_norm(ctx0, cur, eps);
+            cur = ggml_mul(ctx0, cur, model.layers[il].ln_1_w);
+        }
+        else {
             cur = ggml_norm(ctx0, cur, eps);
-
             cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.layers[il].ln_1_w),
                            model.layers[il].ln_1_b);
         }
@@ -787,7 +825,14 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             V = ggml_reshape_3d(ctx0, V, num_positions, d_head, n_head * batch_size);
 
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-            KQ = ggml_soft_max_inplace(ctx0, KQ);
+            const bool inlist = std::find(hparams.full_attn_layers.begin(), hparams.full_attn_layers.end(), il) != hparams.full_attn_layers.end();
+            const bool full_attn = use_window_attn ? inlist : true;
+            if (full_attn) {
+                KQ = ggml_soft_max_inplace(ctx0, KQ);
+            } else {
+                KQ = ggml_soft_max_ext(ctx0, KQ, window_mask, 1.0f, 0.0f);
+            }
+
             struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
             KQV = ggml_reshape_4d(ctx0, KQV, d_head, num_positions, n_head, batch_size);
             KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
@@ -804,25 +849,50 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         embeddings = cur; // embeddings = residual, cur = hidden_states
 
         // layernorm2
-        {
+        if (ctx->use_rms_norm) {
+            cur = ggml_rms_norm(ctx0, cur, eps);
+            cur = ggml_mul(ctx0, cur, model.layers[il].ln_2_w);
+        } else {
             cur = ggml_norm(ctx0, cur, eps);
-
             cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.layers[il].ln_2_w), model.layers[il].ln_2_b);
         }
 
-        cur = ggml_mul_mat(ctx0, model.layers[il].ff_i_w, cur);
-        cur = ggml_add(ctx0, cur, model.layers[il].ff_i_b);
+        // mlp
+        if (ctx->use_glu_mlp) {
+            // ffn_up
+            auto cur_up = ggml_mul_mat(ctx0, model.layers[il].ff_o_w, cur);
+            cur_up = ggml_add(ctx0, cur_up, model.layers[il].ff_o_b);
 
-        if (ctx->use_gelu) {
-            cur = ggml_gelu_inplace(ctx0, cur);
-        } else if (ctx->use_silu) {
-            cur = ggml_silu_inplace(ctx0, cur);
-        } else {
-            cur = ggml_gelu_quick_inplace(ctx0, cur);
+            auto cur_gate = ggml_mul_mat(ctx0, model.layers[il].ff_g_w, cur);
+            cur_gate = ggml_add(ctx0, cur_gate, model.layers[il].ff_g_b);
+            if (ctx->use_gelu) {
+                cur_gate = ggml_gelu_inplace(ctx0, cur_gate);
+            } else if (ctx->use_silu) {
+                cur_gate = ggml_silu_inplace(ctx0, cur_gate);
+            } else {
+                cur_gate = ggml_gelu_quick_inplace(ctx0, cur_gate);
+            }
+            cur = ggml_mul(ctx0, cur_gate, cur_up);
+
+            // ffn_down
+            cur = ggml_mul_mat(ctx0, model.layers[il].ff_i_w, cur);
+            cur = ggml_add(ctx0, cur, model.layers[il].ff_i_b);
         }
+        else {
+            cur = ggml_mul_mat(ctx0, model.layers[il].ff_i_w, cur);
+            cur = ggml_add(ctx0, cur, model.layers[il].ff_i_b);
 
-        cur = ggml_mul_mat(ctx0, model.layers[il].ff_o_w, cur);
-        cur = ggml_add(ctx0, cur, model.layers[il].ff_o_b);
+            if (ctx->use_gelu) {
+                cur = ggml_gelu_inplace(ctx0, cur);
+            } else if (ctx->use_silu) {
+                cur = ggml_silu_inplace(ctx0, cur);
+            } else {
+                cur = ggml_gelu_quick_inplace(ctx0, cur);
+            }
+
+            cur = ggml_mul_mat(ctx0, model.layers[il].ff_o_w, cur);
+            cur = ggml_add(ctx0, cur, model.layers[il].ff_o_b);
+        }
 
         // residual 2
         cur = ggml_add(ctx0, embeddings, cur);
@@ -833,10 +903,17 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
 
     // post-layernorm
     if (ctx->has_post_norm) {
-        embeddings = ggml_norm(ctx0, embeddings, eps);
-        ggml_set_name(embeddings, "post_ln");
+        if (ctx->use_rms_norm) {
+            embeddings = ggml_rms_norm(ctx0, embeddings, eps);
+            ggml_set_name(embeddings, "post_ln");
 
-        embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.post_ln_w), model.post_ln_b);
+            embeddings = ggml_mul(ctx0, embeddings, model.post_ln_w);
+        } else {
+            embeddings = ggml_norm(ctx0, embeddings, eps);
+            ggml_set_name(embeddings, "post_ln");
+
+            embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.post_ln_w), model.post_ln_b);
+        }
     }
 
     // llava projector
@@ -1109,6 +1186,18 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         embeddings = ggml_add(ctx0, embeddings, model.mm_1_b);
     }
 
+    if (use_window_attn) {
+        struct ggml_tensor * inv_window_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, num_positions / 4);
+        ggml_set_name(inv_window_idx, "inv_window_idx");
+        ggml_set_input(inv_window_idx);
+
+        // embeddings shape: [hidden_size, patches_w * patches_h, batch_size]
+        GGML_ASSERT(batch_size == 1);
+        embeddings = ggml_reshape_2d(ctx0, embeddings, hparams.projection_dim, patches_w * patches_h / 4);
+        embeddings = ggml_get_rows(ctx0, embeddings, inv_window_idx);
+        embeddings = ggml_reshape_3d(ctx0, embeddings, hparams.projection_dim, patches_w * patches_h / 4, batch_size);
+    }
+
     // build the graph
     ggml_build_forward_expand(gf, embeddings);
 
@@ -1231,11 +1320,11 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         }
     }
 
-//#ifdef GGML_USE_CUDA
-//    new_clip->backend = ggml_backend_cuda_init(0);
-//    LOG_INF("%s: CLIP using CUDA backend\n", __func__);
-//#endif
-//
+#ifdef GGML_USE_CUDA
+   new_clip->backend = ggml_backend_cuda_init(0);
+   LOG_INF("%s: CLIP using CUDA backend\n", __func__);
+#endif
+
 //#ifdef GGML_USE_METAL
 //    new_clip->backend = ggml_backend_metal_init();
 //    LOG_INF("%s: CLIP using Metal backend\n", __func__);
@@ -1301,6 +1390,20 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             new_clip->use_silu = gguf_get_val_bool(ctx, idx);
         } catch (std::runtime_error & /*e*/) {
             new_clip->use_silu = false;
+        }
+
+        try {
+            idx = get_key_idx(ctx, KEY_USE_GLU_MLP);
+            new_clip->use_glu_mlp = gguf_get_val_bool(ctx, idx);
+        } catch (std::runtime_error & /*e*/) {
+            new_clip->use_glu_mlp = false;
+        }
+
+        try {
+            idx = get_key_idx(ctx, KEY_USE_RMS_NORM);
+            new_clip->use_rms_norm = gguf_get_val_bool(ctx, idx);
+        } catch (std::runtime_error & /*e*/) {
+            new_clip->use_rms_norm = false;
         }
 
         if (verbosity >= 1) {
@@ -1420,6 +1523,15 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
 
         const float * mean_data = (const float *)gguf_get_arr_data(ctx, idx_mean);
         const float * std_data  = (const float *)gguf_get_arr_data(ctx, idx_std);
+
+        try {
+            int idx_full_attn_layers = get_key_idx(ctx, KEY_FULLATTN_BLK_IDX);
+            auto n_full_attn_layers = gguf_get_arr_n(ctx, idx_full_attn_layers);
+            const int * full_attn_layers = (const int *)gguf_get_arr_data(ctx, idx_full_attn_layers);
+            hparams.full_attn_layers.assign(full_attn_layers, full_attn_layers + n_full_attn_layers);
+        } catch (std::runtime_error & /*e*/) {
+
+        }
 
         for (int i = 0; i < 3; ++i) {
             new_clip->image_mean[i] = mean_data[i];
@@ -1602,10 +1714,17 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             layer.q_b    = get_tensor(new_clip->ctx_data, format(TN_ATTN_Q,      "v", il, "bias"));
             layer.v_b    = get_tensor(new_clip->ctx_data, format(TN_ATTN_V,      "v", il, "bias"));
             layer.o_b    = get_tensor(new_clip->ctx_data, format(TN_ATTN_OUTPUT, "v", il, "bias"));
-            layer.ln_1_b = get_tensor(new_clip->ctx_data, format(TN_LN_1,        "v", il, "bias"));
-            layer.ln_2_b = get_tensor(new_clip->ctx_data, format(TN_LN_2,        "v", il, "bias"));
             layer.ff_i_b = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN,    "v", il, "bias"));
             layer.ff_o_b = get_tensor(new_clip->ctx_data, format(TN_FFN_UP,      "v", il, "bias"));
+
+            if (!new_clip->use_rms_norm) {
+                layer.ln_1_b = get_tensor(new_clip->ctx_data, format(TN_LN_1,        "v", il, "bias"));
+                layer.ln_2_b = get_tensor(new_clip->ctx_data, format(TN_LN_2,        "v", il, "bias"));
+            }
+            if (new_clip->use_glu_mlp) {
+                layer.ff_g_w = get_tensor(new_clip->ctx_data, format(TN_FFN_GATE,    "v", il, "weight"));
+                layer.ff_g_b = get_tensor(new_clip->ctx_data, format(TN_FFN_GATE,    "v", il, "bias"));
+            }
         }
     }
 
